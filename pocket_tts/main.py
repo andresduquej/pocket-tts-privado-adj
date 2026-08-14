@@ -1,9 +1,12 @@
 import io
+import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -11,10 +14,10 @@ import typer
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from typing_extensions import Annotated
 
-from pocket_tts.data.audio import stream_audio_chunks
+from pocket_tts.data.audio import StreamingWAVWriter, stream_audio_chunks
 from pocket_tts.default_parameters import (
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_FRAMES_AFTER_EOS,
@@ -55,7 +58,88 @@ web_app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Saved-Filename"],
 )
+
+
+# ------------------------------------------------------
+# Almacenamiento local de audios generados (para que otras apps
+# en la misma máquina puedan listarlos/descargarlos por HTTP)
+# ------------------------------------------------------
+
+STORAGE_DIR = Path.home() / "Andres Duque Studio - Clonador de Voz" / "audios"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+AUTO_NAME_PREFIX = "adc"
+
+
+def _sanitize_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._áéíóúÁÉÍÓÚñÑ -]", "", name).strip()
+    safe = re.sub(r"\s+", "_", safe)
+    return safe or "audio"
+
+
+def _next_auto_name() -> str:
+    existing_nums = []
+    for f in STORAGE_DIR.glob(f"{AUTO_NAME_PREFIX}_*.wav"):
+        m = re.match(rf"{AUTO_NAME_PREFIX}_(\d+)\.wav$", f.name)
+        if m:
+            existing_nums.append(int(m.group(1)))
+    next_n = (max(existing_nums) + 1) if existing_nums else 1
+    return f"{AUTO_NAME_PREFIX}_{next_n:03d}"
+
+
+def _resolve_save_path(save_as: str | None) -> Path:
+    base = _sanitize_filename(save_as.strip()) if save_as and save_as.strip() else _next_auto_name()
+    path = STORAGE_DIR / f"{base}.wav"
+    counter = 1
+    while path.exists():
+        path = STORAGE_DIR / f"{base}_{counter}.wav"
+        counter += 1
+    return path
+
+
+def _safe_storage_path(filename: str) -> Path:
+    """Evita path traversal: solo permite nombres de archivo simples dentro de STORAGE_DIR."""
+    return STORAGE_DIR / Path(filename).name
+
+
+# ------------------------------------------------------
+# Almacenamiento local de voces guardadas (referencias para clonar) --
+# mismo patrón que los audios: compartido por HTTP entre apps locales.
+# ------------------------------------------------------
+
+VOICES_DIR = Path.home() / "Andres Duque Studio - Clonador de Voz" / "voices"
+VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_voice_path(name: str) -> Path:
+    base = _sanitize_filename(name.strip()) if name and name.strip() else "voz"
+    path = VOICES_DIR / f"{base}.wav"
+    counter = 1
+    while path.exists():
+        path = VOICES_DIR / f"{base}_{counter}.wav"
+        counter += 1
+    return path
+
+
+def _safe_voice_path(filename: str) -> Path:
+    """Evita path traversal: solo permite nombres de archivo simples dentro de VOICES_DIR."""
+    return VOICES_DIR / Path(filename).name
+
+
+def _write_metadata(save_path: Path, text: str | None, label: str | None, kind: str):
+    meta = {"text": text, "label": label, "kind": kind, "created_at": time.time()}
+    save_path.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False))
+
+
+def _read_metadata(save_path: Path) -> dict:
+    meta_path = save_path.with_suffix(".json")
+    if not meta_path.is_file():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 @web_app.get("/", response_class=HTMLResponse)
@@ -76,8 +160,13 @@ async def health():
     return {"status": "healthy"}
 
 
-def write_to_queue(queue, text_to_generate, model_state):
-    """Allows writing to the StreamingResponse as if it were a file."""
+def write_to_queue(queue, text_to_generate, model_state, frames_after_eos, save_path):
+    """Allows writing to the StreamingResponse as if it were a file.
+
+    Also tees every generated chunk to a real file on disk (`save_path`) using a
+    second, separate WAV writer -- the disk copy is seekable so its header ends up
+    with the correct final size, unlike the one streamed to the browser.
+    """
 
     class FileLikeToQueue(io.IOBase):
         def __init__(self, queue):
@@ -85,6 +174,7 @@ def write_to_queue(queue, text_to_generate, model_state):
 
         def write(self, data):
             self.queue.put(data)
+            return len(data)
 
         def flush(self):
             pass
@@ -92,17 +182,44 @@ def write_to_queue(queue, text_to_generate, model_state):
         def close(self):
             self.queue.put(None)
 
+    sample_rate = tts_model.config.mimi.sample_rate
+    stream_target = FileLikeToQueue(queue)
+    disk_file = open(save_path, "wb") if save_path is not None else None
+
+    stream_writer = StreamingWAVWriter(stream_target, sample_rate)
+    stream_writer.write_header(sample_rate)
+    disk_writer = None
+    if disk_file is not None:
+        disk_writer = StreamingWAVWriter(disk_file, sample_rate)
+        disk_writer.write_header(sample_rate)
+
     audio_chunks = tts_model.generate_audio_stream(
-        model_state=model_state, text_to_generate=text_to_generate
+        model_state=model_state,
+        text_to_generate=text_to_generate,
+        frames_after_eos=frames_after_eos,
     )
-    stream_audio_chunks(FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate)
+    for chunk in audio_chunks:
+        stream_writer.write_pcm_data(chunk)
+        if disk_writer is not None:
+            disk_writer.write_pcm_data(chunk)
+
+    stream_writer.finalize()
+    if disk_writer is not None:
+        disk_writer.finalize()
+        disk_file.close()
+    stream_target.close()
 
 
-def generate_data_with_state(text_to_generate: str, model_state: dict):
+def generate_data_with_state(
+    text_to_generate: str, model_state: dict, frames_after_eos: int, save_path: Path | None
+):
     queue = Queue()
 
     # Run your function in a thread
-    thread = threading.Thread(target=write_to_queue, args=(queue, text_to_generate, model_state))
+    thread = threading.Thread(
+        target=write_to_queue,
+        args=(queue, text_to_generate, model_state, frames_after_eos, save_path),
+    )
     thread.start()
 
     # Yield data as it becomes available
@@ -122,6 +239,11 @@ def text_to_speech(
     text: str = Form(...),
     voice_url: str | None = Form(None),
     voice_wav: UploadFile | None = File(None),
+    frames_after_eos: int = Form(10),
+    save_as: str | None = Form(None),
+    voice_label: str | None = Form(None),
+    persist: bool = Form(True),
+    saved_voice: str | None = Form(None),
 ):
     """
     Generate speech from text using the pre-loaded voice prompt or a custom voice.
@@ -129,16 +251,29 @@ def text_to_speech(
     Args:
         text: Text to convert to speech
         voice_url: Optional built-in voice name (e.g., "alba"), or voice URL (http://, https://, or hf://)
-        voice_wav: Optional uploaded voice file (mutually exclusive with voice_url)
+        voice_wav: Optional uploaded voice file (mutually exclusive with the others)
+        frames_after_eos: Extra 80ms frames generated after end-of-speech is detected.
+            Higher values leave more trailing audio so the last word/breath isn't cut off.
+        save_as: Optional filename (without extension) to save the result under, in
+            STORAGE_DIR. If omitted, an auto-incrementing "adc_NNN" name is used.
+        voice_label: Optional human-readable label of which voice was used (metadata only).
+        persist: Whether to save the result to disk at all. Set to false for
+            throwaway/intermediate generations (e.g. individual dialogue lines that
+            will be merged client-side into one final file).
+        saved_voice: Filename of a voice previously saved via POST /voices (e.g.
+            "yo_alegre.wav"). Lets other local apps clone by name without having to
+            upload the reference audio on every call.
     """
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    if voice_url is None and voice_wav is None:
+    provided = [v for v in (voice_url, voice_wav, saved_voice) if v is not None]
+    if len(provided) > 1:
+        raise HTTPException(
+            status_code=400, detail="Provide only one of voice_url, voice_wav, or saved_voice"
+        )
+    if not provided:
         voice_url = get_default_voice_for_language(str(tts_model.origin))
-
-    if voice_url is not None and voice_wav is not None:
-        raise HTTPException(status_code=400, detail="Cannot provide both voice_url and voice_wav")
 
     # Use the appropriate model state
     if voice_url is not None:
@@ -153,6 +288,11 @@ def text_to_speech(
             )
         model_state = tts_model._cached_get_state_for_audio_prompt(voice_url)
         logging.warning("Using voice from URL: %s", voice_url)
+    elif saved_voice is not None:
+        voice_path = _safe_voice_path(saved_voice)
+        if not voice_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Saved voice not found: {saved_voice}")
+        model_state = tts_model.get_state_for_audio_prompt(voice_path, truncate=True)
     elif voice_wav is not None:
         # Use uploaded voice file - preserve extension for format detection
         suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
@@ -170,14 +310,116 @@ def text_to_speech(
     else:
         raise HTTPException(status_code=500, detail="This should never happen.")
 
+    save_path = None
+    if persist:
+        save_path = _resolve_save_path(save_as)
+        _write_metadata(save_path, text=text, label=voice_label, kind="single")
+
+    headers = {"Transfer-Encoding": "chunked"}
+    if save_path is not None:
+        headers["Content-Disposition"] = f"attachment; filename={save_path.name}"
+        headers["X-Saved-Filename"] = save_path.name
+
     return StreamingResponse(
-        generate_data_with_state(text, model_state),
+        generate_data_with_state(text, model_state, frames_after_eos, save_path),
         media_type="audio/wav",
-        headers={
-            "Content-Disposition": "attachment; filename=generated_speech.wav",
-            "Transfer-Encoding": "chunked",
-        },
+        headers=headers,
     )
+
+
+@web_app.get("/audios")
+def list_audios():
+    """Lista los audios guardados en disco -- para que otras apps locales los consulten."""
+    files = sorted(STORAGE_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [
+        {
+            "filename": f.name,
+            "size_bytes": f.stat().st_size,
+            "modified_at": f.stat().st_mtime,
+            **_read_metadata(f),
+        }
+        for f in files
+    ]
+
+
+@web_app.get("/audios/{filename}")
+def get_audio(filename: str):
+    path = _safe_storage_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio no encontrado")
+    return FileResponse(path, media_type="audio/wav")
+
+
+@web_app.delete("/audios/{filename}")
+def delete_audio(filename: str):
+    path = _safe_storage_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio no encontrado")
+    path.unlink()
+    meta_path = path.with_suffix(".json")
+    if meta_path.is_file():
+        meta_path.unlink()
+    return {"status": "deleted"}
+
+
+@web_app.post("/audios")
+def upload_audio(
+    audio: UploadFile = File(...),
+    save_as: str | None = Form(None),
+    text: str | None = Form(None),
+    voice_label: str | None = Form(None),
+    kind: str = Form("single"),
+):
+    """Guarda un .wav ya generado en el cliente (ej: el diálogo multi-voz ya unido)."""
+    save_path = _resolve_save_path(save_as)
+    with open(save_path, "wb") as f:
+        f.write(audio.file.read())
+    _write_metadata(save_path, text=text, label=voice_label, kind=kind)
+    return {"filename": save_path.name}
+
+
+@web_app.get("/voices")
+def list_voices():
+    """Lista las voces guardadas -- para clonar por nombre sin volver a subir el audio."""
+    files = sorted(VOICES_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+    return [
+        {
+            "name": f.stem,
+            "filename": f.name,
+            "size_bytes": f.stat().st_size,
+            "modified_at": f.stat().st_mtime,
+        }
+        for f in files
+    ]
+
+
+@web_app.get("/voices/{filename}")
+def get_voice(filename: str):
+    path = _safe_voice_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Voz no encontrada")
+    return FileResponse(path, media_type="audio/wav")
+
+
+@web_app.post("/voices")
+def upload_voice(
+    name: str = Form(...),
+    voice_wav: UploadFile = File(...),
+):
+    """Guarda una muestra de voz con nombre, para reutilizar luego sin volver a subirla."""
+    save_path = _resolve_voice_path(name)
+    with open(save_path, "wb") as f:
+        f.write(voice_wav.file.read())
+    return {"name": save_path.stem, "filename": save_path.name}
+
+
+@web_app.delete("/voices/{filename}")
+def delete_voice(filename: str):
+    path = _safe_voice_path(filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Voz no encontrada")
+    path.unlink()
+    return {"status": "deleted"}
 
 
 @cli_app.command()
